@@ -1,0 +1,96 @@
+#!/system/bin/sh
+set -eu
+umask 077
+MODDIR=$(CDPATH= cd -P "${0%/*}/.." && pwd)
+ENGINE="$MODDIR/bin/srkp_engine"
+LIB="$MODDIR/lib/libscoped_rkp.so"
+STATE="$MODDIR/state"
+fail() { echo "$*" >&2; exit 1; }
+enabled() { [ "$(tr -d ' \r\n' < "$MODDIR/config/autostart")" = 1 ]; }
+allowed() { enabled && [ ! -e "$MODDIR/disable" ] && [ ! -e "$MODDIR/remove" ]; }
+target() {
+  PID=$(/system/bin/pidof keystore2) || fail 'Keystore unavailable.'
+  case "$PID" in ''|*[!0-9]*) fail 'Expected one Keystore process.';; esac
+}
+resolve_scope() {
+  local line package user_id result uid values= count
+  set -f
+  while IFS= read -r line || [ -n "$line" ]; do
+    line=$(printf '%s' "$line" | tr -d '\r'); line=${line%%#*}
+    set -- $line
+    [ "$#" -gt 0 ] || continue
+    [ "$#" -le 3 ] || { echo 'Malformed scope row' >&2; return 1; }
+    package=$1; user_id=${2:-0}
+    case "$package" in *[!A-Za-z0-9_.]*|.*|*..*|*.) echo 'Invalid package name' >&2; return 1;; esac
+    case "$user_id" in ''|*[!0-9]*) echo 'Invalid Android user' >&2; return 1;; esac
+    if [ "$#" = 3 ]; then
+      case "$3" in ''|*[!0-9]*) echo 'Invalid legacy UID column' >&2; return 1;; esac
+    fi
+    # Binder must receive pipes, not a protected module log file as stderr.
+    result=$(/system/bin/cmd package list packages -U --user "$user_id" "$package" 2>&1) || {
+      printf 'Package query failed: %s\n' "$result" >&2; return 1;
+    }
+    uid=$(printf '%s\n' "$result" | awk -v wanted="package:$package" '$1==wanted {for(i=2;i<=NF;i++) if($i ~ /^uid:/) print substr($i,5)}')
+    case "$uid" in '') echo "Not installed: $package user=$user_id" >&2; continue;; *[!0-9]*) echo 'Ambiguous package UID' >&2; return 1;; esac
+    printf '%s\n' "$uid" | awk '$1>=0 && $1<=4294967295 {ok=1} END {exit !ok}' || return 1
+    values="${values}${uid}
+"
+  done < "$MODDIR/config/scope.txt"
+  values=$(printf '%s' "$values" | sed '/^$/d' | sort -nu)
+  count=$(printf '%s\n' "$values" | awk 'NF {n++} END {print n+0}')
+  [ "$count" -le 256 ] || { echo 'At most 256 unique UIDs' >&2; return 1; }
+  printf '%s\n' "$values" | awk 'NF {if(n++) printf ","; printf "%s",$0} END {printf "\n"}'
+}
+[ "$(id -u)" = 0 ] || fail 'Root required.'
+COMMAND=${1:-status}
+case "$COMMAND" in
+  status)
+    printf 'autostart=%s\nglobal_hwc=%s\n' "$(cat "$MODDIR/config/autostart")" "$(/system/bin/getprop ro.boot.hwc)"
+    [ ! -e "$STATE/startup.failed" ] || echo 'Previous startup incomplete; inspect state/startup.log.'
+    target; exec "$ENGINE" status "$PID" "$LIB";;
+  enable|reload|off|disable|boot) :;;
+  *) fail 'Usage: scoped-rkpctl status|enable|reload|off|disable';;
+esac
+[ "$MODDIR" = /data/adb/modules/scoped_rkp ] || fail 'Activate the installed module.'
+mkdir -p "$STATE"
+if [ "$COMMAND" = boot ]; then
+  allowed || exit 0
+  exec 8>"$STATE/startup.lock"
+  /system/bin/flock -n 8 8>&8 || exit 0
+  exec >"$STATE/startup.log" 2>&1
+  [ ! -e "$STATE/startup.failed" ] || { echo 'Previous startup incomplete; automatic retry skipped.'; exit 0; }
+  while allowed; do
+    if [ "$(/system/bin/getprop sys.boot_completed)" = 1 ]; then
+      case "$(/system/bin/am get-started-user-state 0 2>&1)" in
+        RUNNING_UNLOCKED) break;;
+        *'Unknown command'*|*'unknown command'*) fail 'User-unlock interface unavailable.';;
+      esac
+    fi
+    sleep 3
+  done
+  allowed || exit 0
+fi
+exec 9>"$STATE/operation.lock"
+/system/bin/flock -n 9 9>&9 || fail 'Another operation is active.'
+target
+case "$COMMAND" in
+  disable) printf '0\n' > "$MODDIR/config/autostart"; COMMAND=off;;
+  enable) printf '1\n' > "$MODDIR/config/autostart";;
+esac
+if [ "$COMMAND" = off ]; then exec "$ENGINE" disable "$PID" "$LIB"; fi
+[ "$(/system/bin/getprop sys.boot_completed)" = 1 ] || fail 'Android is still starting.'
+case "$(/system/bin/getprop ro.boot.hwc)" in CN|cn) :;; *) echo 'HWC is not CN; no replacement needed.'; exit 0;; esac
+UIDS=$(resolve_scope) || fail 'Invalid scope; existing policy unchanged.'
+[ -n "$UIDS" ] || exec "$ENGINE" disable "$PID" "$LIB"
+if [ "$COMMAND" = boot ]; then
+  SNAPSHOT=$("$ENGINE" status "$PID" "$LIB") || exit 1
+  if printf '%s' "$SNAPSHOT" | grep -q '"loaded":true'; then echo 'Library already mapped; startup skipped.'; exit 0; fi
+fi
+printf 'pid=%s\n' "$PID" > "$STATE/startup.failed"
+sync
+if "$ENGINE" enable "$PID" "$LIB" "$UIDS"; then
+  rm -f "$STATE/startup.failed"
+  echo 'ScopedRKP enabled.'
+else
+  echo 'Activation failed; no automatic retry.' >&2; exit 1
+fi

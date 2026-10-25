@@ -1,0 +1,10 @@
+ScopedRKP
+Copyright (C) 2026 lbbbbbal
+
+The injector is derived from JingMatrix/TEESimulator, commit
+06f9f2ee11b86c5144a1f345f70f8fb23cae4493, licensed under GPL-3.0.
+Upstream: https://github.com/JingMatrix/TEESimulator
+
+Modified to load a scoped property-view library. The simulator, key material,
+certificate handling, namespace switching and relabeling are not included.
+Corresponding source: https://github.com/lbbbbbal/ScopedRKP

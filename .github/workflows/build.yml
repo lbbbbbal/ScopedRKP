@@ -1,0 +1,60 @@
+name: Build and prerelease
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7.0.1
+        with:
+          persist-credentials: false
+      - name: Policy and shell tests
+        run: |
+          mkdir -p build
+          g++ -std=c++20 -O2 -pthread -Isrc tests/policy_test.cpp -o build/policy_test
+          ./build/policy_test
+          python3 tests/test_scope.py
+          python3 tests/test_boot.py
+      - name: Install NDK
+        run: |
+          sdkmanager --install 'ndk;29.0.14206865'
+          echo "ANDROID_NDK_HOME=$ANDROID_HOME/ndk/29.0.14206865" >> "$GITHUB_ENV"
+      - name: Build and verify
+        run: |
+          python3 scripts/build.py
+          python3 scripts/verify_package.py
+      - uses: actions/upload-artifact@v7.0.2
+        with:
+          name: ScopedRKP
+          path: dist/*
+  release:
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/download-artifact@v8.0.2
+        with:
+          name: ScopedRKP
+          path: dist
+      - name: Publish new version as prerelease
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          version=$(sed -n 's/^version=//p' module/module.prop)
+          tag="v$version"
+          if gh release view "$tag" >/dev/null 2>&1; then
+            echo "Release $tag already exists; leaving its assets unchanged."
+          else
+            gh release create "$tag" dist/* --target "$GITHUB_SHA" --prerelease --title "ScopedRKP $version preview" --notes-file VALIDATION.md
+          fi
